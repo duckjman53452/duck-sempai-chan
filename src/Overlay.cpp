@@ -1,5 +1,7 @@
 #include "Overlay.hpp"
 #include "Buffer.hpp"
+#include "Predict.hpp"
+#include "TimingMap.hpp"
 
 #include <algorithm>
 
@@ -10,14 +12,22 @@ namespace buffer {
 namespace {
 constexpr size_t kMaxStoredLines = 8;
 
-constexpr float kWidth = 138.f;
+constexpr float kWidth = 168.f;
 constexpr float kPadX = 9.f;
 constexpr float kPadY = 5.f;
 constexpr float kHeaderH = 13.f;
-constexpr float kStatsH = 10.f;
+constexpr float kRowH = 10.f;
 constexpr float kLineH = 9.f;
 constexpr float kGap = 4.f;
 constexpr float kMargin = 6.f;
+
+CCLabelBMFont* smallLabel(std::string const& text, ccColor3B color, float maxScale) {
+    auto label = CCLabelBMFont::create(text.c_str(), "chatFont.fnt");
+    label->setAnchorPoint({ 0.f, .5f });
+    label->setColor(color);
+    label->limitLabelWidth(kWidth - kPadX * 2, maxScale, .1f);
+    return label;
+}
 } // namespace
 
 Overlay* Overlay::create() {
@@ -39,6 +49,7 @@ Overlay* Overlay::current() {
 bool Overlay::init() {
     if (!CCNode::init()) return false;
     this->rebuild();
+    this->schedule(schedule_selector(Overlay::refreshDiag), .5f);
     return true;
 }
 
@@ -57,17 +68,37 @@ void Overlay::place() {
     });
 }
 
+std::string Overlay::diagText() {
+    auto const& d = Engine::get().diag();
+    auto const& c = Predictor::get().counters();
+    return fmt::format("in {} | {} tps | route {} | map {} look {} hold {} | sims {} ({} crash, {} ?)",
+        d.inputs, m_tps, d.mapMatches, d.mapShifts, d.lookShifts, d.holdSaves, c.runs, c.crashes, c.unknown);
+}
+
+void Overlay::refreshDiag(float) {
+    auto tick = Engine::get().tick();
+    m_tps = tick >= m_lastTick ? static_cast<int>((tick - m_lastTick) * 2) : 0;
+    m_lastTick = tick;
+    if (m_diag) {
+        m_diag->setString(diagText().c_str());
+        m_diag->limitLabelWidth(kWidth - kPadX * 2, .42f, .1f);
+    }
+}
+
 void Overlay::rebuild() {
     this->removeAllChildrenWithCleanup(true);
     m_chip = nullptr;
+    m_diag = nullptr;
     m_accent = nullptr;
 
     auto& engine = Engine::get();
     auto mod = Mod::get();
     auto stage = engine.stage();
     bool off = stage == Stage::Off;
+    bool showMap = mod->getSettingValue<bool>("map-enabled");
+    bool showDiag = mod->getSettingValue<bool>("diagnostics");
 
-    if (off && mod->getSettingValue<bool>("hide-when-off")) {
+    if (off && mod->getSettingValue<bool>("hide-when-off") && !showDiag) {
         this->setVisible(false);
         return;
     }
@@ -77,27 +108,23 @@ void Overlay::rebuild() {
     int wanted = off ? 0 : static_cast<int>(mod->getSettingValue<int64_t>("log-lines"));
     int shown = std::min<int>(wanted, static_cast<int>(m_lines.size()));
 
-    float height = kPadY * 2 + kHeaderH;
-    if (!off) height += kStatsH;
+    int rows = (off ? 0 : 1) + (showMap ? 1 : 0) + (showDiag ? 1 : 0);
+    float height = kPadY * 2 + kHeaderH + rows * kRowH;
     if (shown > 0) height += kGap + shown * kLineH;
     this->setContentSize({ kWidth, height });
 
-    // Panel
     auto bg = CCScale9Sprite::create("square02_small.png");
     bg->setContentSize({ kWidth, height });
     bg->setAnchorPoint({ 0.f, 0.f });
-    bg->setPosition({ 0.f, 0.f });
-    bg->setOpacity(off ? 80 : 120);
+    bg->setOpacity(off ? 90 : 120);
     this->addChild(bg, 0);
 
-    // Stage accent bar on the left edge
     m_accent = CCLayerColor::create({ m_color.r, m_color.g, m_color.b, 230 }, 2.f, height - 8.f);
     m_accent->setPosition({ 3.f, 4.f });
     this->addChild(m_accent, 1);
 
-    // Header
+    // header
     float y = height - kPadY - kHeaderH / 2;
-
     auto title = CCLabelBMFont::create("INPUT BUFFER", "bigFont.fnt");
     title->setScale(.3f);
     title->setAnchorPoint({ 0.f, .5f });
@@ -112,38 +139,40 @@ void Overlay::rebuild() {
     m_chip->setColor(m_color);
     this->addChild(m_chip, 2);
 
-    // Stats
-    if (!off) {
-        y -= kHeaderH / 2 + kStatsH / 2;
-        auto const& st = engine.stats();
-        auto statsText = st.savesAttempt == 0
-            ? fmt::format("no saves this attempt   session {}", st.savesSession)
-            : fmt::format("{} saved this attempt   best +{}t", st.savesAttempt, st.bestSave);
+    float rowY = y - kHeaderH / 2 - kRowH / 2;
+    auto addRow = [&](CCLabelBMFont* label) {
+        label->setPosition({ kPadX, rowY });
+        this->addChild(label, 2);
+        rowY -= kRowH;
+    };
 
-        auto stats = CCLabelBMFont::create(statsText.c_str(), "chatFont.fnt");
-        stats->setAnchorPoint({ 0.f, .5f });
-        stats->setPosition({ kPadX, y });
-        stats->setColor({ 190, 190, 205 });
-        stats->limitLabelWidth(kWidth - kPadX * 2, .5f, .1f);
-        this->addChild(stats, 2);
+    if (!off) {
+        auto const& st = engine.stats();
+        auto text = st.savesAttempt == 0
+            ? fmt::format("no shifts this attempt   session {}", st.savesSession)
+            : fmt::format("{} shift{} this attempt   best +{}t", st.savesAttempt, st.savesAttempt == 1 ? "" : "s", st.bestSave);
+        addRow(smallLabel(text, { 190, 190, 205 }, .5f));
+    }
+    if (showMap) {
+        auto const& map = TimingMap::get();
+        addRow(smallLabel(map.statusText(), map.statusColor(), .5f));
+    }
+    if (showDiag) {
+        m_diag = smallLabel(diagText(), { 150, 150, 170 }, .42f);
+        addRow(m_diag);
     }
 
-    // Log
     if (shown > 0) {
-        float lineTop = y - kStatsH / 2 - kGap / 2;
-
+        float lineTop = rowY + kRowH / 2 - kGap / 2;
         auto divider = CCLayerColor::create({ 255, 255, 255, 28 }, kWidth - kPadX * 2, 1.f);
         divider->setPosition({ kPadX, lineTop });
         this->addChild(divider, 2);
 
         for (int i = 0; i < shown; ++i) {
             auto const& line = m_lines[i];
-            auto label = CCLabelBMFont::create(line.text.c_str(), "chatFont.fnt");
-            label->setAnchorPoint({ 0.f, .5f });
+            auto label = smallLabel(line.text, line.color, .45f);
             label->setPosition({ kPadX, lineTop - kGap / 2 - kLineH / 2 - i * kLineH });
-            label->setColor(line.color);
             label->setOpacity(static_cast<GLubyte>(std::max(90, 255 - i * 40)));
-            label->limitLabelWidth(kWidth - kPadX * 2, .45f, .1f);
             this->addChild(label, 2);
         }
     }

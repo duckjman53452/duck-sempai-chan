@@ -25,31 +25,35 @@ struct PlayerSnap {
     bool dashing = false;
 };
 
-// Discrete modes (cube, ball, UFO, robot, spider): an early release is held
-// until the click has been used. One slot per input side (0 = P1, 1 = P2).
+// Cube-style modes without map coverage: an early release is held until the
+// click has been used. One slot per input side (0 = P1, 1 = P2).
 struct InputSlot {
-    bool tracking = false;   // a press is live and hasn't been resolved yet
-    bool consumed = false;   // the press produced an action
-    bool deferred = false;   // finger is up early; we're holding the release for N ticks
+    bool tracking = false;
+    bool consumed = false;
+    bool deferred = false;
     int button = 1;
-    Stage stage = Stage::Off;  // stage at the moment the release was deferred
+    Stage stage = Stage::Off;
     uint64_t pressTick = 0;
     uint64_t releaseTick = 0;
     uint64_t consumedTick = 0;
+    cocos2d::CCPoint releasePos{};
     std::array<PlayerSnap, 2> snap{};
 };
 
-// Flight modes (ship, wave, swing): a press or release that would crash within
-// the reaction margin is delayed to the nearest tick that keeps the icon alive.
-struct PendingFlight {
+enum class ShiftSource { Map, Lookahead };
+
+// A click or release that's being held back a few ticks (map or look-ahead).
+struct PendingShift {
     bool active = false;
     bool down = false;
     int button = 1;
-    int delay = 0;          // ticks the input is being held back
-    int wouldDieIn = 0;     // ticks to the crash had it been sent on time
+    int delay = 0;
+    int wouldDieIn = 0;  // look-ahead only: ticks to the crash had it been sent on time
     uint64_t applyTick = 0;
     Stage stage = Stage::Off;
+    ShiftSource source = ShiftSource::Map;
     char const* mode = "";
+    cocos2d::CCPoint inputPos{};
 };
 
 struct Stats {
@@ -58,6 +62,16 @@ struct Stats {
     int bestSave = 0;
     int lastSave = 0;
     int unusedAttempt = 0;
+};
+
+// Counters for the diagnostics line. If the buffer "does nothing", these show
+// which link of the chain isn't firing.
+struct Diag {
+    int inputs = 0;        // jump presses/releases that reached the hook
+    int mapMatches = 0;    // inputs where the player was on the shadow route
+    int mapShifts = 0;
+    int lookShifts = 0;
+    int holdSaves = 0;
 };
 
 class Engine {
@@ -71,38 +85,40 @@ public:
 
     int windowTicks() const { return windowFor(m_stage); }
     static int windowFor(Stage stage);
-    static std::string stageName(Stage stage);   // "Stage 2"
-    static std::string stageChip(Stage stage);   // "S2 / 4t"
+    static std::string stageName(Stage stage);
+    static std::string stageChip(Stage stage);
     static cocos2d::ccColor3B stageColor(Stage stage);
 
     // --- called from hooks ---
-    // True if this button event should go through the buffer at all.
     bool handles(GJBaseGameLayer* layer, int button) const;
-    // Returns true if the original handleButton should run now, false if swallowed.
+    // Returns true if the original handleButton should run now, false if held back.
     bool onButton(GJBaseGameLayer* layer, bool down, int button, bool isPlayer1);
-    // Runs once per physics step, before the game processes that step's inputs.
     void onTick(GJBaseGameLayer* layer, bool countTick);
-    // New attempt (level start / respawn). Flushes any held input first.
     void onAttemptStart(GJBaseGameLayer* layer);
-    // Leaving the level: drop everything, the layer is going away.
     void onLevelExit();
 
     uint64_t tick() const { return m_tick; }
     Stats const& stats() const { return m_stats; }
+    Diag const& diag() const { return m_diag; }
 
 private:
     Engine();
 
-    // discrete
+    struct MapAdvice {
+        bool onRoute = false;  // player matches the shadow route here
+        int delay = 0;         // > 0: move the input this many ticks later
+    };
+    MapAdvice adviseFromMap(GJBaseGameLayer* layer, PlayerObject* p, bool before, bool down) const;
+
+    bool onFlightButton(GJBaseGameLayer* layer, bool before, bool down, int button, bool isPlayer1);
     bool onDiscreteButton(GJBaseGameLayer* layer, bool down, int button, bool isPlayer1);
+
+    void hold(GJBaseGameLayer* layer, size_t side, PendingShift shift);
+    void dispatchPending(GJBaseGameLayer* layer, size_t side, bool applyPress = true);
     void dispatchRelease(GJBaseGameLayer* layer, InputSlot& slot, bool isPlayer1);
 
-    // flight
-    bool onFlightButton(GJBaseGameLayer* layer, bool down, int button, bool isPlayer1);
-    void dispatchFlight(GJBaseGameLayer* layer, size_t side, bool applyPress = true);
-
-    void recordSave(Stage stage, int saved, uint64_t atTick, bool isPlayer1);
-    void recordFlightSave(PendingFlight const& pend, uint64_t atTick, bool isPlayer1);
+    void recordShift(GJBaseGameLayer* layer, PendingShift const& shift, uint64_t atTick, bool isPlayer1);
+    void recordHoldSave(GJBaseGameLayer* layer, InputSlot const& slot, int saved, uint64_t atTick, bool isPlayer1);
     void recordUnused(Stage stage, int waited, bool isPlayer1);
     void bumpStats(int saved);
 
@@ -110,9 +126,10 @@ private:
     uint64_t m_tick = 0;
     bool m_dispatching = false;
     std::array<InputSlot, 2> m_slots{};
-    std::array<PendingFlight, 2> m_pending{};
+    std::array<PendingShift, 2> m_pending{};
     std::array<bool, 2> m_gameHeld{};  // button state the game has actually been given
     Stats m_stats{};
+    Diag m_diag{};
 };
 
 } // namespace buffer

@@ -62,6 +62,56 @@
 			"max": 16,
 			"control": { "arrows": true, "slider": true, "slider-step": 1, "input": false }
 		},
+		"map-title": {
+			"type": "title",
+			"name": "Shadow Map",
+			"description": "When a level opens, a hidden shadow icon plays through it, finds a route that survives, and works out how early or late each of its clicks can be. While you play on that route, early inputs are moved into those safe windows."
+		},
+		"map-enabled": {
+			"type": "bool",
+			"name": "Shadow Map",
+			"description": "Build the shadow map when a level opens. The game pauses briefly while it's built. Not used in platformer, 2-player or dual sections.",
+			"default": true
+		},
+		"map-time-limit": {
+			"type": "int",
+			"name": "Scan Time Limit (s)",
+			"description": "Longest the level-open pause may last. Long or hard levels may need more; the overlay shows how much of the level got mapped.",
+			"default": 5,
+			"min": 1,
+			"max": 20,
+			"enable-if": "map-enabled",
+			"control": { "arrows": true, "slider": true, "slider-step": 1, "input": false }
+		},
+		"show-shadow-path": {
+			"type": "bool",
+			"name": "Show Shadow Route",
+			"description": "Draw the shadow's route in the level: blue while it holds, white while released, dots for clicks (blue) and releases (pink), green bars for each input's safe window.",
+			"default": true,
+			"enable-if": "map-enabled"
+		},
+		"visuals-title": {
+			"type": "title",
+			"name": "Seeing It Work"
+		},
+		"show-shifts": {
+			"type": "bool",
+			"name": "Show Frame Shifts",
+			"description": "Every time an input is moved: a ring where you actually pressed, a dot where the game got it, and a floating +Nt. Blue = shadow map, yellow = look-ahead, green = held release.",
+			"default": true
+		},
+		"show-lookahead": {
+			"type": "bool",
+			"name": "Show Look-ahead Paths",
+			"description": "When the live look-ahead steps in, draw the path that would have crashed (red, with an X) and the one it picked (green).",
+			"default": true
+		},
+		"diagnostics": {
+			"type": "bool",
+			"name": "Diagnostics Line",
+			"description": "Show live counters in the overlay: inputs seen, physics ticks per second, inputs on the shadow route, shifts by source, and look-ahead simulations. If the buffer seems to do nothing, this shows where it stops.",
+			"default": true
+		},
 		"flight-title": {
 			"type": "title",
 			"name": "Ship / Wave / Swing",

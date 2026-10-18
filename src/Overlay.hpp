@@ -2,6 +2,7 @@
 
 #include <Geode/Geode.hpp>
 
+#include <cstdint>
 #include <deque>
 #include <string>
 
@@ -9,19 +10,17 @@ namespace buffer {
 
 // Compact status panel pinned to a screen corner while playing:
 //
-//   | INPUT BUFFER          S2 / 4t |   <- header, chip colored by stage
-//   | 3 saved this attempt  best +4t |   <- stats
-//   | ------------------------------ |
-//   | +2t   tick #12044   P1         |   <- newest save first, older ones fade
-//   | +1t   tick #11190   P1         |
-//
-// Always visible while a stage is active.
+//   | INPUT BUFFER               S2 / 4t |  header, chip colored by stage
+//   | 3 shifts this attempt    best +4t  |  stats (stage on)
+//   | MAP 100%  412 inputs  3.1s         |  shadow map status
+//   | in 38 | 240 tps | route 12 | ...   |  diagnostics (live, 2x per second)
+//   | ---------------------------------- |
+//   | +2t wave click  map  #12044        |  newest shift first, older ones fade
 class Overlay : public cocos2d::CCNode {
 public:
     static Overlay* create();
-    static Overlay* current();  // the overlay in the running PlayLayer, if any
+    static Overlay* current();
 
-    // Short centered banner, used for stage changes.
     static void toast(std::string const& text, cocos2d::ccColor3B color);
 
     void rebuild();
@@ -31,6 +30,8 @@ public:
 protected:
     bool init() override;
     void place();
+    void refreshDiag(float);
+    std::string diagText();
 
     struct Line {
         std::string text;
@@ -39,8 +40,11 @@ protected:
     std::deque<Line> m_lines;
 
     cocos2d::CCLabelBMFont* m_chip = nullptr;
+    cocos2d::CCLabelBMFont* m_diag = nullptr;
     cocos2d::CCLayerColor* m_accent = nullptr;
     cocos2d::ccColor3B m_color = { 150, 150, 160 };
+    uint64_t m_lastTick = 0;
+    int m_tps = 0;
 };
 
 } // namespace buffer

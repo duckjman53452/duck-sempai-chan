@@ -2,15 +2,12 @@
 
 Forgives inputs that come a few physics ticks too early.
 
-**Cube, ball, UFO, robot, spider:** if you tap and let go before a jump is possible (still in the air, not yet on the orb), the release is held for a short window. If the game would have used the click during that window, it does.
+**Shadow map:** when a level opens, a hidden shadow icon plays through it, finds a route that survives, and works out how early or late each of its clicks can be. The route is drawn into the level. While you follow it, early inputs are moved into those safe windows.
 
-**Ship, wave, swing:** every click and release is checked by simulating your path a few ticks ahead with the game's own physics. If sending it now would crash you almost immediately, it's held back to the nearest tick in the window where the path survives.
+**Off the route:** ship, wave and swing inputs are checked with a short live look-ahead, and other modes hold an early release until the click is used.
 
-**Stages** (cycle with **F6** in a level, or from the pause menu):
+**Seeing it work:** every moved input shows a ring where you pressed, a dot where the game got it, and a floating **+Nt**. The overlay has a map status line and live diagnostics.
 
-- **Off**: vanilla input
-- **Stage 1**: 1-2 ticks
-- **Stage 2**: 4 ticks (3-6 configurable)
-- **Stage 3**: 12 ticks (8-16 configurable), for testing and demos
+**Stages** (F6 in a level, or the pause menu): Off, Stage 1 (1-2 ticks), Stage 2 (3-6), Stage 3 (8-16).
 
-While any stage is active an overlay shows the stage and every saved input. This is an assist mod: runs made with it aren't legitimate for leaderboards or demon list submissions.
+This is an assist mod: runs made with it aren't legitimate for leaderboards or demon list submissions.

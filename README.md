@@ -1,118 +1,70 @@
 # Input Buffer: Geode mod for Geometry Dash
 
 Target: **Geode v5.10.1, GD 2.2081** (Windows / Android / macOS / iOS).
+All sources pass a full compile check (`-fsyntax-only`) against the Geode v5.10.1 headers and the 2.2081 bindings. Every hooked function has a real address on every platform.
 
 ```
 input-buffer/
-├── mod.json          settings, keybind, metadata
-├── about.md          in-game mod description
-├── CMakeLists.txt
+├── mod.json                 settings, keybind, metadata
+├── .github/workflows/       GitHub build -> one .geode for every platform
 └── src/
-    ├── Buffer.hpp/.cpp   buffer engine: discrete release-hold + flight-mode delay search
-    ├── Predict.hpp/.cpp  look-ahead simulator (hidden clone players, GD's own physics)
-    ├── SimHooks.cpp      stops clones from affecting the real game during simulation
-    ├── Overlay.hpp/.cpp  corner status panel + stage-change toast
-    └── main.cpp          hooks: input, physics step, level lifecycle, pause menu, hotkey
+    ├── TimingMap.hpp/.cpp   shadow scan at level open: route + safe window per input
+    ├── Predict.hpp/.cpp     hidden clone players running GD's own physics
+    ├── SimHooks.cpp         keeps clones from touching the real game
+    ├── Buffer.hpp/.cpp      input engine: map -> look-ahead -> release hold
+    ├── Visuals.hpp/.cpp     shadow route, frame-shift markers, look-ahead paths
+    ├── Overlay.hpp/.cpp     corner panel: stage, map status, diagnostics, log
+    └── main.cpp             hooks + level lifecycle + pause menu + F6
 ```
 
-## Build
+## Building
 
-```
-# once: install the Geode CLI + SDK  (https://docs.geode-sdk.org/getting-started)
-geode sdk install
-geode sdk install-binaries
+Push the folder to a GitHub repo. The included workflow builds it on GitHub's servers (Actions tab → *Build Output* artifact → `.geode`). Change `id` / `developer` in `mod.json` first if you like.
 
-cd input-buffer
-geode build          # produces build/yourname.input-buffer.geode
-```
+## What happens when a level opens
 
-Change `id` / `developer` in `mod.json` before building. Drop the `.geode` file into GD via *Geode → Install from file*.
+1. **Shadow scan** (`TimingMap::scan`), queued for the frame after the level finishes loading:
+   - A hidden clone icon starts at your start position and plays the level with GD's own `PlayerObject::update` + `checkCollisions`. It searches inputs depth-first, deciding every 2 ticks and trying "keep the current input" before "switch". Duplicate states are pruned, and it backtracks from every crash until it reaches the end or hits the time limit (default 5 s).
+   - The route found is replayed tick by tick and recorded: x, y, mode, gravity, and button state per tick.
+   - Each click/release on the route is re-tested 1…16 ticks earlier and later (the rest of the route unchanged, `Look-ahead` ticks of survival required). This gives every input a safe window.
+   - The level is then reset, so portals, orbs and pads the shadow used are back to normal. The attempt counter isn't bumped.
+2. **Shadow route drawn into the level**: thin line (blue = holding, white = released), blue dots = clicks, pink dots = releases, green bars = safe windows.
+3. A toast and the overlay's MAP line show the result, e.g. `MAP 100%  412 inputs  3.1s` or `MAP 63%  (time limit)`.
 
-## How it works
+## What happens on every input
 
-### Where it hooks
+In order, first match wins:
 
-| Hook | Role |
+| | When | What it does | Marker color |
+|---|---|---|---|
+| 1 | You're **on the shadow route**: same mode and gravity, within 6 units of its y, same button state | Inside the input's safe window → untouched. Up to N ticks *early* → moved into the window, aiming between the earliest safe tick and the shadow's own tick. | blue |
+| 2 | Ship / wave / swing, **off the route** | Live look-ahead: if sending it now crashes within the reaction margin, delay it to the nearest tick that survives. | yellow |
+| 3 | Other modes, **off the route** | Early release is held until the click gets used (orb, landing). | green |
+
+N is the stage window (Stage 1: 1-2, Stage 2: 3-6, Stage 3: 8-16 ticks). **Off** = vanilla.
+
+## Seeing it change frames
+
+- **Frame-shift marker** (in the level): a **ring** where you actually pressed, a **dot** where the game received it, a line between, and a floating **+Nt**. Colored by source (table above).
+- **Look-ahead paths**: when #2 steps in, the path that would have crashed is drawn in **red with an X**, and the one it picked in **green**.
+- **Overlay log**: `+3t wave click  map  #12044`. Console: `[Buffer] Stage 2 map moved wave click +3 ticks on tick #12044 (P1) into the shadow's safe window`.
+
+## Diagnostics line
+
+`in 38 | 240 tps | route 12 | map 3 look 1 hold 0 | sims 30 (4 crash, 2 ?)`
+
+| Reading | Means |
 |---|---|
-| `GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick)` | Runs once per physics step (240/s). `Engine::onTick` runs **before** the original, so held releases are resolved before the step's inputs and physics. |
-| `GJBaseGameLayer::handleButton(down, button, isPlayer1)` | Where each press/release reaches the game. `Engine::onButton` may swallow a release. |
-| `PlayLayer::init / resetLevel / onQuit` | Adds the overlay, resets the tick counter and per-attempt stats. |
-| `PauseLayer::customSetup` | Adds the stage button and a settings shortcut. |
+| `in` stays 0 while you click | the input hook isn't firing |
+| `tps` far from 240 | tick counting is off, so windows are wrong length |
+| `route` stays 0 | you're never matching the shadow route (or MAP failed) |
+| `sims` rises, `crash` always 0 | clones never detect deaths: look-ahead can't trigger |
+| `crash` ≈ `sims` even on easy parts | clones die instantly: state copy is wrong |
+| stage chip says `OFF` | press F6 or use the pause-menu button; nothing is changed while Off |
 
-### The mechanism: hold, don't replay
+## Limits
 
-Rather than inventing a synthetic click on a guessed "valid frame", the engine **extends the hold**:
-
-1. **Press**: passed through untouched. The engine snapshots the player (last jump time, last flip time, y-velocity, gravity, dash state).
-2. **Release**: if the press hasn't produced an action yet, and the player is in a discrete mode, the release is swallowed. GD still sees the button as held.
-3. **Each tick**: the engine checks whether an action happened since the press:
-   - `m_lastJumpTime` / `m_lastFlipTime` changed (jumps, ring jumps, ball/spider flips)
-   - `m_isUpsideDown` flipped (blue/green orbs)
-   - `m_isDashing` went true (dash orbs)
-   - fallback: a y-velocity jump larger than gravity can produce in one tick
-4. **Resolve**:
-   - Action happened → send the release on the next tick and log `saved = consumedTick − releaseTick`.
-   - N ticks passed with no action → send the release. Optionally log it as unused.
-   - Player died, stage switched to Off, or a new press arrived → release immediately.
-
-Because the game's own hold logic does the jump (cube landing with the button down, GD 2.2's buffered orbs), the motion is exactly what vanilla produces for a slightly longer hold. There's no teleporting or position correction to look odd in slow motion. The only difference from vanilla is that the button stays down for at most N extra ticks.
-
-The synthetic release goes back through `layer->handleButton(...)`, so other mods and GD's own input recording see an ordinary release. A re-entry flag keeps the engine from catching its own dispatch.
-
-### Ship / wave / swing: simulate, then delay
-
-In these modes there's no "valid frame" to wait for, because holding *is* the movement. A fixed wave angle doesn't capture it either: ship and swing paths curve, and speed portals, mini size and gravity change the slope. So instead of computing angles, the buffer runs the game's own physics ahead of time on two hidden clone players (`Predict.cpp`).
-
-On every click or release in a flight mode:
-
-1. **Quick check (the common case)**: clone the icon, apply the input now, and step it `margin` ticks (default 6, about 25 ms) with `PlayerObject::update` + `checkCollisions`. If it survives, the input goes through untouched. This costs about 6 simulated steps per input.
-2. **Imminent crash**: the input would kill you within the margin, faster than anyone could steer out. Try delaying it by k = 1…N ticks (N = stage window). For each k: hold the old state for k ticks, switch, and count how long the icon survives afterwards, up to `lookahead` ticks (default 48).
-3. **Pick**: the smallest k that survives the whole look-ahead, or failing that the k that survives longest, but only if it beats the margin. If holding the old state crashes before tick k, larger delays can't help, so the search stops. If nothing beats sending it now, the input goes through as-is.
-4. **Apply**: the input is swallowed and re-sent through `handleButton` on tick `now + k`. The overlay logs it as `+3t wave click   #12044   P1`. The console logs `... delayed wave press 3 ticks ... would have crashed in 2`.
-
-The margin is what keeps this from over-steering. In a tight wave corridor, almost any input leads to a crash 20-30 ticks later if you never touched the button again. Those crashes are yours to steer around, so they're ignored. Only near-instant crashes count, like clipping a spike corner because you clicked 2 ticks early.
-
-Dual mode simulates both icons, and a timing must keep both alive. Mixed dual (cube + wave) goes through the flight path as well.
-
-**Limits, by design:**
-- **Delays only.** A click that comes too *late* can't be fixed without rewinding the icon. That would be a visible snap, so late inputs are left alone. In practice this covers about half of mistimed inputs, the early ones.
-- **Static world.** The look-ahead checks collisions against the level as it is on the tick of your input. Moving saws and move triggers are frozen for those few ticks, so at Stage 3 with fast-moving hazards a pick can occasionally be off.
-- **Unknown outcomes stay hands-off.** If a simulated path touches an orb, pad, portal, teleport or touch trigger, that run is marked unknown and never used to justify a delay. Gravity portals are the exception and are simulated on the clone.
-- **Cost.** An actual rescue at Stage 3 can simulate up to ~16 × 64 steps once. Stages 1-2 stay small. Turn *Flight Buffer* off in settings to drop back to vanilla flight input.
-
-### Keeping clones from touching the game
-
-While a simulation runs, `SimHooks.cpp` intercepts everything a clone could do to the real game:
-
-| Hook | During simulation |
-|---|---|
-| `PlayLayer::destroyPlayer` | clone crash recorded, real death path never runs |
-| `playerTouchedRing`, `playerTouchedTrigger`, `bumpPlayer`, `playerWillSwitchMode`, `teleportPlayer`, `toggleDualMode` | run aborted (unknown) |
-| `flipGravity` | applied to the clone only, no level effects |
-| `pickupItem`, `destroyObject`, `gameEventTriggered` | skipped (no coins, keys, broken blocks or event triggers) |
-| `PlayerObject::tryPlaceCheckpoint` | skipped for clones (no practice auto-checkpoints) |
-| `PlayerObject::update` | records the real step delta so clones advance the same amount |
-
-Platformer mode is skipped entirely.
-
-## Things to verify in-game
-
-These are written against the public 2.2081 bindings but haven't been run:
-
-- **Clone sync**: at Stage 3, turn on *Log Unused Buffers* and fly a wave through an easy section. You should see no flight saves at all. If saves appear on clean inputs, `copyAttributes` isn't carrying some state across. Extend `Predictor::sync` (mini size, speed, gravity are the usual suspects).
-- **Step order**: clones run `update` then `checkCollisions` per step. If the real loop also calls `PlayerObject::postCollision` / `updateRotation` in between and predictions drift, add those to `Predictor::step`.
-- **Clone creation**: clones are `PlayerObject::create(1, 1, layer, layer->m_objectLayer, false)`, invisible, with effects off. Check that no stray trail or particles appear at the level start position.
-
-- **Tick rate**: confirm `processCommands` with `isHalfTick == false` fires about 240×/s (log `Engine::tick()` once a second). If half-ticks are counted wrong, windows will be 2× too long or short.
-- **Orbs while held**: buffering an orb relies on GD activating it while the button is still down. If a particular orb type demands a fresh click edge, early taps on it won't be saved. Check yellow, blue, dash and spider orbs at Stage 3, where it's easiest to see.
-- **Detection false positives**: pads and gravity portals also trip the "action happened" check. That just ends the window early, which is harmless but means a few saves won't register.
-- **Pause menu placement**: the button row sits bottom-right. Adjust `menu->setPosition` in `main.cpp` if it overlaps anything on your layout.
-
-## Overlay & telemetry
-
-- Corner panel: stage chip (`S2 / 4t`), saves this attempt, best save, then the newest saves (`+2t   tick #12044   P1`) fading with age. It pulses on each save.
-- Stage change: centered toast (`Stage 2 - 4 tick window`).
-- Console: with *Console Telemetry* on, every save and stage change is mirrored to the Geode console and log file, e.g. `[Buffer] Stage 1 saved 2 ticks on tick #12044 (P1)`.
-- Settings for position, scale, log length, hide-when-off and unused-buffer logging are in the mod's settings, or the gear button in the pause menu. Overlay settings apply on the next stage change, save, or level load.
-
-The overlay can't be hidden while a stage is active. That's deliberate; see the note in `about.md`.
+- **Frozen-level scan.** GD only runs triggers and moves objects while the level actually plays, so the scan sees the level as it is at the start. Anywhere move/toggle/spawn triggers change the layout, the map's route can be wrong. The "on the route" check stops it from being used where you aren't actually following it, and the live look-ahead covers flight modes there.
+- **Delays only.** A late input can't be pulled earlier without snapping the icon backwards.
+- **One shadow.** Dual portals stop the scan (`MAP nn% (dual portal)`). Platformer and 2-player levels skip the map.
+- **Big levels** may need a longer *Scan Time Limit*. The level-open pause lasts up to that long.

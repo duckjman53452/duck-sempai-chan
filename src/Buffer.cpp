@@ -1,8 +1,11 @@
 #include "Buffer.hpp"
 #include "Overlay.hpp"
 #include "Predict.hpp"
+#include "TimingMap.hpp"
+#include "Visuals.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 using namespace geode::prelude;
 
@@ -10,31 +13,26 @@ namespace buffer {
 
 namespace {
 
-// A single physics tick can't add this much upward speed through gravity alone,
-// so a jump this big between two ticks means an action fired (jump, orb, pad).
 constexpr double kImpulse = 4.0;
 constexpr double kMinActionSpeed = 3.0;
+constexpr float kRouteYTolerance = 6.f;  // how close to the shadow route counts as "on it"
+constexpr int kEventSearch = 24;         // ticks around the player to look for the matching route input
 
 bool isPlayLayer(GJBaseGameLayer* layer) {
     auto pl = PlayLayer::get();
     return pl && static_cast<GJBaseGameLayer*>(pl) == layer;
 }
 
+bool isTwoPlayer(GJBaseGameLayer* layer) {
+    return layer->m_levelSettings && layer->m_levelSettings->m_twoPlayerMode;
+}
+
 // Which players a given input side drives.
-// 2-player levels: each side drives its own icon. Otherwise one button drives
-// player 1, plus player 2 while a dual portal is active.
 std::array<PlayerObject*, 2> playersFor(GJBaseGameLayer* layer, bool isPlayer1) {
-    bool twoPlayer = layer->m_levelSettings && layer->m_levelSettings->m_twoPlayerMode;
-    if (twoPlayer) {
+    if (isTwoPlayer(layer)) {
         return { isPlayer1 ? layer->m_player1 : layer->m_player2, nullptr };
     }
     return { layer->m_player1, layer->m_gameState.m_isDualMode ? layer->m_player2 : nullptr };
-}
-
-// Ship, wave and swing: the button steers continuously, so instead of waiting
-// for a "valid frame" the flight path is simulated (see onFlightButton).
-bool isFlightMode(PlayerObject* p) {
-    return p->m_isShip || p->m_isDart || p->m_isSwing;
 }
 
 bool anyFlight(std::array<PlayerObject*, 2> const& players) {
@@ -51,23 +49,11 @@ bool anyDead(std::array<PlayerObject*, 2> const& players) {
     return false;
 }
 
-char const* modeName(PlayerObject* p) {
-    if (!p) return "";
-    if (p->m_isDart) return "wave";
-    if (p->m_isShip) return "ship";
-    if (p->m_isSwing) return "swing";
-    if (p->m_isBird) return "ufo";
-    if (p->m_isBall) return "ball";
-    if (p->m_isRobot) return "robot";
-    if (p->m_isSpider) return "spider";
-    return "cube";
-}
-
-char const* flightModeName(std::array<PlayerObject*, 2> const& players) {
+char const* sideModeName(std::array<PlayerObject*, 2> const& players) {
     for (auto p : players) {
-        if (p && isFlightMode(p)) return modeName(p);
+        if (p && isFlightMode(p)) return modeName(modeOf(p));
     }
-    return modeName(players[0]);
+    return players[0] ? modeName(modeOf(players[0])) : "";
 }
 
 void snapshot(PlayerObject* p, PlayerSnap& snap) {
@@ -78,29 +64,28 @@ void snapshot(PlayerObject* p, PlayerSnap& snap) {
     snap.dashing = p->m_isDashing;
 }
 
-// Did this player do something since the press? Checked once per tick against
-// the snapshot; prevYVelocity is refreshed by the caller after each check.
 bool actionHappened(PlayerObject* p, PlayerSnap const& snap) {
-    if (p->m_lastJumpTime != snap.lastJumpTime) return true;   // jump / ring jump
-    if (p->m_lastFlipTime != snap.lastFlipTime) return true;   // ball / spider flip
-    if (p->m_isUpsideDown != snap.upsideDown) return true;     // blue / green orb
-    if (p->m_isDashing && !snap.dashing) return true;          // dash orb
-
-    // Fallback for anything that doesn't touch the timestamps above.
-    // m_yVelocity is gravity-relative in GD, so "up" is always positive.
+    if (p->m_lastJumpTime != snap.lastJumpTime) return true;
+    if (p->m_lastFlipTime != snap.lastFlipTime) return true;
+    if (p->m_isUpsideDown != snap.upsideDown) return true;
+    if (p->m_isDashing && !snap.dashing) return true;
     double v = p->m_yVelocity;
     double dv = v - snap.prevYVelocity;
-    if (dv > kImpulse && v > kMinActionSpeed) return true;                         // upward launch
-    if (-dv > kImpulse && v < -kMinActionSpeed && !p->m_isOnGround) return true;   // black orb
+    if (dv > kImpulse && v > kMinActionSpeed) return true;
+    if (-dv > kImpulse && v < -kMinActionSpeed && !p->m_isOnGround) return true;
     return false;
 }
 
-bool consoleEnabled() {
-    return Mod::get()->getSettingValue<bool>("console-log");
+bool setting(char const* key) {
+    return Mod::get()->getSettingValue<bool>(key);
 }
 
 int intSetting(char const* key, int lo, int hi) {
     return static_cast<int>(std::clamp<int64_t>(Mod::get()->getSettingValue<int64_t>(key), lo, hi));
+}
+
+ccColor3B sourceColor(ShiftSource s) {
+    return s == ShiftSource::Map ? visuals::kMapColor : visuals::kLookColor;
 }
 
 } // namespace
@@ -111,7 +96,7 @@ Engine& Engine::get() {
 }
 
 Engine::Engine() {
-    if (Mod::get()->getSettingValue<bool>("remember-stage")) {
+    if (setting("remember-stage")) {
         auto saved = Mod::get()->getSavedValue<int64_t>("stage", 0);
         m_stage = static_cast<Stage>(std::clamp<int64_t>(saved, 0, 3));
     }
@@ -156,7 +141,7 @@ void Engine::setStage(Stage stage) {
     m_stage = stage;
     Mod::get()->setSavedValue<int64_t>("stage", static_cast<int64_t>(stage));
 
-    if (consoleEnabled()) {
+    if (setting("console-log")) {
         log::info("[Buffer] Mode -> {} ({} ticks)", stageName(stage), windowFor(stage));
     }
     if (auto overlay = Overlay::current()) overlay->rebuild();
@@ -173,11 +158,18 @@ void Engine::cycleStage() {
 }
 
 // ---------------------------------------------------------------- input entry
+//
+// Every jump press/release goes through here, in this order:
+//   1. Shadow map: if you're on the shadow's route and this input is a few
+//      ticks earlier than its safe window, move it into the window.
+//   2. Ship/wave/swing off the route: live look-ahead (simulate, delay if
+//      sending it now crashes within the reaction margin).
+//   3. Other modes off the route: hold an early release until the click is used.
 
 bool Engine::handles(GJBaseGameLayer* layer, int button) const {
-    if (button != 1) return false;  // PlayerButton::Jump only; platformer left/right untouched
+    if (button != 1) return false;  // PlayerButton::Jump only
     if (!isPlayLayer(layer)) return false;
-    if (layer->m_levelSettings && layer->m_levelSettings->m_platformerMode) return false;
+    if (layer->m_isPlatformer || (layer->m_levelSettings && layer->m_levelSettings->m_platformerMode)) return false;
     return true;
 }
 
@@ -189,35 +181,148 @@ bool Engine::onButton(GJBaseGameLayer* layer, bool down, int button, bool isPlay
         m_gameHeld[side] = down;
         return true;
     }
+    m_diag.inputs++;
+
+    // A newer input supersedes anything still held back on this side.
+    if (m_pending[side].active) dispatchPending(layer, side);
+    if (down && m_slots[side].deferred) dispatchRelease(layer, m_slots[side], isPlayer1);
 
     auto players = playersFor(layer, isPlayer1);
-    bool flight = m_stage != Stage::Off
-        && Mod::get()->getSettingValue<bool>("flight-enabled")
-        && anyFlight(players);
+    bool before = m_gameHeld[side];
+    bool pass = true;
 
-    bool pass = flight
-        ? onFlightButton(layer, down, button, isPlayer1)
+    if (m_stage == Stage::Off || before == down || anyDead(players)) {
+        if (down == false) m_slots[side].tracking = false;
+        if (down && m_stage != Stage::Off) {
+            // still feed the cube-style tracker so its state stays correct
+            pass = onDiscreteButton(layer, down, button, isPlayer1);
+        }
+        if (pass) m_gameHeld[side] = down;
+        return pass;
+    }
+
+    // 1. shadow map (single-icon play only)
+    bool singleIcon = isPlayer1 && !isTwoPlayer(layer) && players[1] == nullptr;
+    if (singleIcon && setting("map-enabled")) {
+        auto advice = adviseFromMap(layer, players[0], before, down);
+        if (advice.onRoute) {
+            m_diag.mapMatches++;
+            if (advice.delay > 0) {
+                PendingShift shift;
+                shift.down = down;
+                shift.button = button;
+                shift.delay = advice.delay;
+                shift.source = ShiftSource::Map;
+                shift.mode = sideModeName(players);
+                hold(layer, side, shift);
+                return false;
+            }
+            if (anyFlight(players)) {
+                // on the route and inside the safe window: nothing to fix
+                m_gameHeld[side] = down;
+                return true;
+            }
+        }
+    }
+
+    // 2 / 3
+    pass = (setting("flight-enabled") && anyFlight(players))
+        ? onFlightButton(layer, before, down, button, isPlayer1)
         : onDiscreteButton(layer, down, button, isPlayer1);
 
     if (pass) m_gameHeld[side] = down;
     return pass;
 }
 
-// ---------------------------------------------------------------- discrete modes
+// ---------------------------------------------------------------- 1. shadow map
+
+Engine::MapAdvice Engine::adviseFromMap(GJBaseGameLayer* layer, PlayerObject* p, bool before, bool down) const {
+    auto const& map = TimingMap::get();
+    if (!p || !map.usable()) return {};
+
+    int tp = map.tickAtX(p->getPositionX());
+    if (tp < 0) return {};
+    auto const& s = map.path()[tp];
+    if (s.mode != modeOf(p) || s.upsideDown != p->m_isUpsideDown || s.held != before) return {};
+    if (std::fabs(s.y - p->getPositionY()) > kRouteYTolerance) return {};
+
+    auto ev = map.nearestEvent(tp, down, kEventSearch);
+    if (!ev || !ev->windowKnown) return {};
+
+    MapAdvice advice;
+    advice.onRoute = true;
+    int lo = ev->tick + ev->earliest;
+    int hi = ev->tick + ev->latest;
+    if (tp >= lo && tp <= hi) return advice;  // already inside the safe window
+
+    if (tp < lo) {
+        // Early: aim between the earliest safe tick and the shadow's own tick.
+        int target = lo + (ev->tick - lo) / 2;
+        int k = target - tp;
+        if (k >= 1 && k <= windowTicks()) advice.delay = k;
+    }
+    // Late inputs can't be fixed without rewinding the icon; leave them.
+    return advice;
+}
+
+// ---------------------------------------------------------------- 2. live look-ahead
+
+bool Engine::onFlightButton(GJBaseGameLayer* layer, bool before, bool down, int button, bool isPlayer1) {
+    size_t side = isPlayer1 ? 0 : 1;
+    auto players = playersFor(layer, isPlayer1);
+    m_slots[side].tracking = false;
+
+    auto& predictor = Predictor::get();
+    if (!predictor.ready(layer)) return true;
+
+    int margin = intSetting("flight-margin", 2, 16);
+    int lookahead = intSetting("flight-lookahead", 16, 120);
+    int window = windowTicks();
+
+    std::vector<CCPoint> nowTrace;
+    auto now = predictor.run(layer, players, before, down, 0, margin, &nowTrace);
+    if (now.aborted || now.afterSurvived >= margin) return true;
+
+    int bestDelay = 0;
+    int bestLife = now.afterSurvived;
+    for (int k = 1; k <= window; ++k) {
+        auto r = predictor.run(layer, players, before, down, k, lookahead);
+        if (r.beforeSurvived < k) break;
+        if (r.aborted) continue;
+        if (r.afterSurvived > bestLife) {
+            bestLife = r.afterSurvived;
+            bestDelay = k;
+            if (bestLife >= lookahead) break;
+        }
+    }
+    if (bestDelay == 0 || bestLife < margin) return true;
+
+    if (setting("show-lookahead")) {
+        std::vector<CCPoint> chosen;
+        predictor.run(layer, players, before, down, bestDelay, lookahead, &chosen);
+        visuals::drawTrace(layer, nowTrace, { 1.f, .3f, .3f, .9f }, true);
+        visuals::drawTrace(layer, chosen, { .4f, 1.f, .5f, .8f }, false);
+    }
+
+    PendingShift shift;
+    shift.down = down;
+    shift.button = button;
+    shift.delay = bestDelay;
+    shift.wouldDieIn = now.afterSurvived + 1;
+    shift.source = ShiftSource::Lookahead;
+    shift.mode = sideModeName(players);
+    hold(layer, side, shift);
+    return false;
+}
+
+// ---------------------------------------------------------------- 3. cube-style release hold
 
 bool Engine::onDiscreteButton(GJBaseGameLayer* layer, bool down, int button, bool isPlayer1) {
     size_t side = isPlayer1 ? 0 : 1;
     auto& slot = m_slots[side];
     auto players = playersFor(layer, isPlayer1);
 
-    // Left a flight section with a delayed input still queued: let it go first.
-    if (m_pending[side].active) dispatchFlight(layer, side);
-
     if (down) {
-        // A new click while we're still holding the last one: hand GD the
-        // release first so this press arrives as a real, fresh click.
-        if (slot.deferred) dispatchRelease(layer, slot, isPlayer1);
-
         slot = InputSlot{};
         slot.tracking = true;
         slot.button = button;
@@ -228,19 +333,20 @@ bool Engine::onDiscreteButton(GJBaseGameLayer* layer, bool down, int button, boo
         return true;
     }
 
-    // ---- release ----
     bool shouldHold = slot.tracking && !slot.consumed && slot.button == button
         && m_stage != Stage::Off && !anyDead(players) && !anyFlight(players);
     if (!shouldHold) {
         slot.tracking = false;
-        return true;  // normal release
+        return true;
     }
 
-    // The click hasn't done anything yet. Keep it held (GD sees the button as
-    // still down) and let onTick decide when to really let go.
     slot.deferred = true;
     slot.releaseTick = m_tick;
     slot.stage = m_stage;
+    if (players[0]) {
+        slot.releasePos = players[0]->getPosition();
+        visuals::markInput(layer, slot.releasePos, visuals::kHoldColor);
+    }
     return false;
 }
 
@@ -249,85 +355,30 @@ void Engine::dispatchRelease(GJBaseGameLayer* layer, InputSlot& slot, bool isPla
     slot.deferred = false;
     slot.tracking = false;
 
-    // Goes back through the full hook chain (so other mods and GD's own input
-    // recording see a normal release); our hook lets it through untouched.
     m_dispatching = true;
     layer->handleButton(false, button, isPlayer1);
     m_dispatching = false;
 }
 
-// ---------------------------------------------------------------- flight modes
-//
-// When the button changes in ship / wave / swing:
-//
-//   1. Simulate sending it now for `margin` ticks. If the icon survives (or the
-//      path hits an orb/pad/portal we can't predict), send it now. This is the
-//      normal case and costs `margin` simulated steps.
-//   2. Otherwise the input would crash within `margin` ticks, faster than
-//      anyone can react and correct. Try sending it 1..N ticks later instead:
-//      keep the old state for k ticks, then switch, and see how long the icon
-//      lives after the switch (up to `lookahead` ticks).
-//   3. Use the smallest k that survives the full look-ahead, or failing that
-//      the k that survives longest, as long as it beats the margin. If the
-//      old state crashes before tick k, larger delays can't help either.
-//
-// Only delays are possible: an input that comes too late can't be moved
-// earlier without rewinding the icon, which would be visible.
+// ---------------------------------------------------------------- held shifts
 
-bool Engine::onFlightButton(GJBaseGameLayer* layer, bool down, int button, bool isPlayer1) {
-    size_t side = isPlayer1 ? 0 : 1;
-    auto players = playersFor(layer, isPlayer1);
-
-    // Clear any older work on this side first.
-    if (m_slots[side].deferred) dispatchRelease(layer, m_slots[side], isPlayer1);
-    m_slots[side].tracking = false;
-    if (m_pending[side].active) dispatchFlight(layer, side);
-
-    bool before = m_gameHeld[side];
-    if (before == down || anyDead(players)) return true;
-
-    auto& predictor = Predictor::get();
-    if (!predictor.ready(layer)) return true;
-
-    int margin = intSetting("flight-margin", 2, 16);
-    int lookahead = intSetting("flight-lookahead", 16, 120);
-    int window = windowTicks();
-
-    auto now = predictor.run(layer, players, before, down, 0, margin);
-    if (now.aborted || now.afterSurvived >= margin) return true;
-
-    int bestDelay = 0;
-    int bestLife = now.afterSurvived;
-    for (int k = 1; k <= window; ++k) {
-        auto r = predictor.run(layer, players, before, down, k, lookahead);
-        if (r.beforeSurvived < k) break;  // old state crashes first: later is no better
-        if (r.aborted) continue;          // can't tell, skip this candidate
-        if (r.afterSurvived > bestLife) {
-            bestLife = r.afterSurvived;
-            bestDelay = k;
-            if (bestLife >= lookahead) break;  // fully safe: earliest such tick wins
-        }
+void Engine::hold(GJBaseGameLayer* layer, size_t side, PendingShift shift) {
+    auto players = playersFor(layer, side == 0);
+    shift.active = true;
+    shift.applyTick = m_tick + static_cast<uint64_t>(shift.delay);
+    shift.stage = m_stage;
+    if (players[0]) {
+        shift.inputPos = players[0]->getPosition();
+        visuals::markInput(layer, shift.inputPos, sourceColor(shift.source));
     }
-    if (bestDelay == 0 || bestLife < margin) return true;  // nothing better, send as-is
-
-    auto& pend = m_pending[side];
-    pend = PendingFlight{};
-    pend.active = true;
-    pend.down = down;
-    pend.button = button;
-    pend.delay = bestDelay;
-    pend.wouldDieIn = now.afterSurvived + 1;
-    pend.applyTick = m_tick + bestDelay;
-    pend.stage = m_stage;
-    pend.mode = flightModeName(players);
-    return false;
+    m_pending[side] = shift;
 }
 
-void Engine::dispatchFlight(GJBaseGameLayer* layer, size_t side, bool applyPress) {
+void Engine::dispatchPending(GJBaseGameLayer* layer, size_t side, bool applyPress) {
     auto pend = m_pending[side];
     m_pending[side].active = false;
     if (!pend.active) return;
-    if (pend.down && !applyPress) return;  // dropped press (e.g. on respawn)
+    if (pend.down && !applyPress) return;
 
     m_dispatching = true;
     layer->handleButton(pend.down, pend.button, side == 0);
@@ -339,24 +390,22 @@ void Engine::dispatchFlight(GJBaseGameLayer* layer, size_t side, bool applyPress
 void Engine::onTick(GJBaseGameLayer* layer, bool countTick) {
     if (countTick) ++m_tick;
 
-    // Flight: release delayed inputs on their tick.
     for (size_t s = 0; s < m_pending.size(); ++s) {
         auto& pend = m_pending[s];
         if (!pend.active) continue;
         auto players = playersFor(layer, s == 0);
 
         if (anyDead(players) || m_stage == Stage::Off) {
-            dispatchFlight(layer, s, !anyDead(players));
+            dispatchPending(layer, s, !anyDead(players));
             continue;
         }
         if (m_tick >= pend.applyTick) {
             auto copy = pend;
-            dispatchFlight(layer, s);
-            recordFlightSave(copy, m_tick, s == 0);
+            dispatchPending(layer, s);
+            recordShift(layer, copy, m_tick, s == 0);
         }
     }
 
-    // Discrete: watch held releases for the moment the click gets used.
     for (size_t s = 0; s < m_slots.size(); ++s) {
         auto& slot = m_slots[s];
         if (!slot.tracking) continue;
@@ -377,20 +426,15 @@ void Engine::onTick(GJBaseGameLayer* layer, bool countTick) {
         }
 
         if (!slot.deferred) {
-            // Still physically held. Once it has done its job there's nothing
-            // left to watch; the eventual release goes through untouched.
             if (slot.consumed) slot.tracking = false;
             continue;
         }
 
         if (slot.consumed) {
-            // The held click turned into an action on the tick before this one.
-            // Ticks saved = how many ticks after the real release it happened.
             int saved = static_cast<int>(slot.consumedTick - slot.releaseTick);
-            auto stage = slot.stage;
-            auto at = slot.consumedTick;
+            auto copy = slot;
             dispatchRelease(layer, slot, isPlayer1);
-            recordSave(stage, saved, at, isPlayer1);
+            recordHoldSave(layer, copy, saved, copy.consumedTick, isPlayer1);
             continue;
         }
 
@@ -409,10 +453,10 @@ void Engine::onAttemptStart(GJBaseGameLayer* layer) {
     for (size_t s = 0; s < m_slots.size(); ++s) {
         if (layer) {
             if (m_slots[s].deferred) dispatchRelease(layer, m_slots[s], s == 0);
-            dispatchFlight(layer, s, false);  // held releases go out, held presses are dropped
+            dispatchPending(layer, s, false);
         }
         m_slots[s] = InputSlot{};
-        m_pending[s] = PendingFlight{};
+        m_pending[s] = PendingShift{};
     }
     m_gameHeld = {};
     m_tick = 0;
@@ -428,6 +472,8 @@ void Engine::onLevelExit() {
     m_tick = 0;
     m_stats.savesAttempt = 0;
     m_stats.unusedAttempt = 0;
+    m_diag = {};
+    Predictor::get().resetCounters();
 }
 
 // ---------------------------------------------------------------- telemetry
@@ -439,45 +485,62 @@ void Engine::bumpStats(int saved) {
     m_stats.bestSave = std::max(m_stats.bestSave, saved);
 }
 
-void Engine::recordSave(Stage stage, int saved, uint64_t atTick, bool isPlayer1) {
-    bumpStats(saved);
+void Engine::recordShift(GJBaseGameLayer* layer, PendingShift const& shift, uint64_t atTick, bool isPlayer1) {
+    bumpStats(shift.delay);
+    bool fromMap = shift.source == ShiftSource::Map;
+    (fromMap ? m_diag.mapShifts : m_diag.lookShifts)++;
+
+    auto color = sourceColor(shift.source);
+    auto players = playersFor(layer, isPlayer1);
+    if (players[0]) visuals::markApplied(layer, shift.inputPos, players[0]->getPosition(), shift.delay, color);
 
     char const* side = isPlayer1 ? "P1" : "P2";
-    if (consoleEnabled()) {
-        log::info("[Buffer] {} saved {} tick{} on tick #{} ({})",
-            stageName(stage), saved, saved == 1 ? "" : "s", atTick, side);
+    char const* what = shift.down ? "click" : "release";
+    if (setting("console-log")) {
+        if (fromMap) {
+            log::info("[Buffer] {} map moved {} {} +{} tick{} on tick #{} ({}) into the shadow's safe window",
+                stageName(shift.stage), shift.mode, what, shift.delay, shift.delay == 1 ? "" : "s", atTick, side);
+        }
+        else {
+            log::info("[Buffer] {} look-ahead moved {} {} +{} tick{} on tick #{} ({}), would have crashed in {}",
+                stageName(shift.stage), shift.mode, what, shift.delay, shift.delay == 1 ? "" : "s",
+                atTick, side, shift.wouldDieIn);
+        }
     }
     if (auto overlay = Overlay::current()) {
-        overlay->pushLine(fmt::format("+{}t   tick #{}   {}", saved, atTick, side), stageColor(stage));
+        overlay->pushLine(
+            fmt::format("+{}t {} {}  {}  #{}", shift.delay, shift.mode, shift.down ? "click" : "rel",
+                fromMap ? "map" : "look", atTick),
+            color
+        );
         overlay->pulse();
     }
 }
 
-void Engine::recordFlightSave(PendingFlight const& pend, uint64_t atTick, bool isPlayer1) {
-    bumpStats(pend.delay);
+void Engine::recordHoldSave(GJBaseGameLayer* layer, InputSlot const& slot, int saved, uint64_t atTick, bool isPlayer1) {
+    bumpStats(saved);
+    m_diag.holdSaves++;
+
+    auto players = playersFor(layer, isPlayer1);
+    if (players[0]) visuals::markApplied(layer, slot.releasePos, players[0]->getPosition(), saved, visuals::kHoldColor);
 
     char const* side = isPlayer1 ? "P1" : "P2";
-    char const* what = pend.down ? "press" : "release";
-    if (consoleEnabled()) {
-        log::info("[Buffer] {} delayed {} {} {} tick{} on tick #{} ({}), would have crashed in {}",
-            stageName(pend.stage), pend.mode, what, pend.delay, pend.delay == 1 ? "" : "s",
-            atTick, side, pend.wouldDieIn);
+    if (setting("console-log")) {
+        log::info("[Buffer] {} held release {} tick{} on tick #{} ({})",
+            stageName(slot.stage), saved, saved == 1 ? "" : "s", atTick, side);
     }
     if (auto overlay = Overlay::current()) {
-        overlay->pushLine(
-            fmt::format("+{}t {} {}   #{}   {}", pend.delay, pend.mode, pend.down ? "click" : "rel", atTick, side),
-            stageColor(pend.stage)
-        );
+        overlay->pushLine(fmt::format("+{}t release held  hold  #{}", saved, atTick), visuals::kHoldColor);
         overlay->pulse();
     }
 }
 
 void Engine::recordUnused(Stage stage, int waited, bool isPlayer1) {
     m_stats.unusedAttempt++;
-    if (!Mod::get()->getSettingValue<bool>("show-expired")) return;
+    if (!setting("show-expired")) return;
 
     char const* side = isPlayer1 ? "P1" : "P2";
-    if (consoleEnabled()) {
+    if (setting("console-log")) {
         log::info("[Buffer] {} held {} ticks, unused ({})", stageName(stage), waited, side);
     }
     if (auto overlay = Overlay::current()) {

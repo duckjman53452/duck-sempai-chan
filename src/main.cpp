@@ -8,35 +8,42 @@
 #include "Buffer.hpp"
 #include "Overlay.hpp"
 #include "Predict.hpp"
+#include "TimingMap.hpp"
+#include "Visuals.hpp"
 
 using namespace geode::prelude;
 using buffer::Engine;
+using buffer::Predictor;
+using buffer::TimingMap;
 
 // ------------------------------------------------------------------ input path
 //
+//   level opens  ->  shadow scan (TimingMap): hidden icon plays the level,
+//                    route + safe window per input, drawn into the level
+//
 //   keyboard / mouse
 //        |
-//   GD input queue  ->  processCommands(step)            <- one call per physics step
-//                            |  Engine::onTick            (resolve held clicks first)
-//                            |  original processCommands
-//                            |     -> handleButton        <- Engine::onButton may swallow a release
-//                            v
-//                       player update / collisions
+//   processCommands(step)            one call per physics step
+//        |  Engine::onTick           release inputs whose delay is up
+//        |  original
+//        |     -> handleButton       Engine::onButton may hold an input back
+//        v
+//   player update / collisions
 
 class $modify(BufferBaseLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
         auto& engine = Engine::get();
         if (engine.handles(this, button) && !engine.onButton(this, down, button, isPlayer1)) {
-            return;  // release is being held for the buffer window
+            return;  // held back for a few ticks
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (PlayLayer::get() == static_cast<GJBaseGameLayer*>(this)) {
-            // Half ticks are sub-steps inside a tick; count only whole ticks so
-            // the window stays in real 240/s physics ticks.
-            Engine::get().onTick(this, !isHalfTick);
+            auto& engine = Engine::get();
+            engine.onTick(this, !isHalfTick);
+            if ((engine.tick() & 7) == 0) buffer::visuals::cullRoute(this);
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
@@ -44,17 +51,48 @@ class $modify(BufferBaseLayer, GJBaseGameLayer) {
 
 // ------------------------------------------------------------------ level lifecycle
 
+namespace {
+
+void runShadowScan(PlayLayer* pl) {
+    if (PlayLayer::get() != pl) return;  // left the level before the scan ran
+    if (!Mod::get()->getSettingValue<bool>("map-enabled")) return;
+
+    TimingMap::get().scan(pl);
+
+    // The shadow went through portals / orbs / pads for real, so put the level
+    // back exactly as a fresh attempt. Keep the attempt counter unchanged.
+    int attempts = pl->m_attempts;
+    pl->resetLevel();
+    pl->m_attempts = attempts;
+    pl->updateAttempts();
+
+    buffer::visuals::buildRoute(pl);
+    if (auto overlay = buffer::Overlay::current()) overlay->rebuild();
+    buffer::Overlay::toast(TimingMap::get().statusText(), TimingMap::get().statusColor());
+}
+
+} // namespace
+
 class $modify(BufferPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        TimingMap::get().clear();
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
         Engine::get().onLevelExit();  // clean slate for the new level
-        buffer::Predictor::get().attach(this);
+        Predictor::get().attach(this);
         if (auto overlay = buffer::Overlay::create()) {
             overlay->setID("overlay"_spr);
             this->addChild(overlay, 1000);
         }
         return true;
+    }
+
+    void setupHasCompleted() {
+        PlayLayer::setupHasCompleted();
+        Predictor::get().attach(this);
+        // Run on the next frame, once the level and the player are fully placed.
+        auto self = this;
+        Loader::get()->queueInMainThread([self] { runShadowScan(self); });
     }
 
     void resetLevel() {
@@ -64,7 +102,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
     void onQuit() {
         Engine::get().onLevelExit();
-        buffer::Predictor::get().detach();
+        TimingMap::get().clear();
+        buffer::visuals::clearRoute(this);
+        Predictor::get().detach();
         PlayLayer::onQuit();
     }
 };
@@ -133,7 +173,7 @@ class $modify(BufferPauseLayer, PauseLayer) {
 $on_game(Loaded) {
     listenForKeybindSettingPresses("cycle-keybind", [](Keybind const&, bool down, bool repeat, double) {
         if (!down || repeat) return;
-        if (!PlayLayer::get()) return;  // only while in a level
+        if (!PlayLayer::get()) return;
         Engine::get().cycleStage();
     });
 }
