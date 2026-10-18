@@ -1,0 +1,142 @@
+{
+	"geode": "5.10.1",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "yourname.input-buffer",
+	"name": "Input Buffer",
+	"version": "v1.0.0",
+	"developer": "YourName",
+	"description": "Forgives early clicks by holding them for a few physics ticks, with a live status overlay.",
+	"tags": ["gameplay", "cheat"],
+	"settings": {
+		"controls-title": {
+			"type": "title",
+			"name": "Controls"
+		},
+		"cycle-keybind": {
+			"type": "keybind",
+			"name": "Cycle Stage",
+			"description": "Cycles Off -> Stage 1 -> Stage 2 -> Stage 3 while in a level. Applies to the very next input, no restart needed.",
+			"default": "F6",
+			"category": "gameplay"
+		},
+		"remember-stage": {
+			"type": "bool",
+			"name": "Remember Stage",
+			"description": "Start each session on the stage you last used instead of Off.",
+			"default": false
+		},
+		"windows-title": {
+			"type": "title",
+			"name": "Buffer Windows",
+			"description": "How many physics ticks (240 per second) an early click is held for at each stage."
+		},
+		"stage1-ticks": {
+			"type": "int",
+			"name": "Stage 1 (Subtle)",
+			"description": "Forgives clicks released 1-2 ticks too early.",
+			"default": 2,
+			"min": 1,
+			"max": 2,
+			"control": { "arrows": true, "slider": false, "input": false }
+		},
+		"stage2-ticks": {
+			"type": "int",
+			"name": "Stage 2 (Moderate)",
+			"description": "Forgives clicks released a few ticks too early.",
+			"default": 4,
+			"min": 3,
+			"max": 6,
+			"control": { "arrows": true, "slider": false, "input": false }
+		},
+		"stage3-ticks": {
+			"type": "int",
+			"name": "Stage 3 (Showcase)",
+			"description": "Very forgiving. Meant for debugging and demonstrating the buffer.",
+			"default": 12,
+			"min": 8,
+			"max": 16,
+			"control": { "arrows": true, "slider": true, "slider-step": 1, "input": false }
+		},
+		"flight-title": {
+			"type": "title",
+			"name": "Ship / Wave / Swing",
+			"description": "In these modes the buffer simulates your path ahead of time. If sending a click or release right now would crash you almost immediately, it's held back to the nearest tick (within the stage window) where the path survives."
+		},
+		"flight-enabled": {
+			"type": "bool",
+			"name": "Flight Buffer",
+			"description": "Delay ship, wave and swing inputs that would crash you within the reaction margin.",
+			"default": true
+		},
+		"flight-margin": {
+			"type": "int",
+			"name": "Reaction Margin",
+			"description": "Only step in when an input would crash you within this many ticks (240 per second). Crashes further out are left for you to steer around.",
+			"default": 6,
+			"min": 2,
+			"max": 16,
+			"enable-if": "flight-enabled",
+			"control": { "arrows": true, "slider": false, "input": false }
+		},
+		"flight-lookahead": {
+			"type": "int",
+			"name": "Look-ahead",
+			"description": "How many ticks a delayed input must keep you alive to count as fully safe. Higher picks safer timings but simulates more when a crash is detected.",
+			"default": 48,
+			"min": 16,
+			"max": 120,
+			"enable-if": "flight-enabled",
+			"control": { "arrows": true, "arrow-step": 4, "slider": true, "slider-step": 4, "input": false }
+		},
+		"overlay-title": {
+			"type": "title",
+			"name": "Overlay"
+		},
+		"overlay-corner": {
+			"type": "string",
+			"name": "Position",
+			"default": "Top Left",
+			"one-of": ["Top Left", "Top Right", "Bottom Left", "Bottom Right"]
+		},
+		"overlay-scale": {
+			"type": "float",
+			"name": "Scale",
+			"default": 1.0,
+			"min": 0.5,
+			"max": 1.5,
+			"control": { "slider": true, "slider-step": 0.05, "arrows": true, "arrow-step": 0.1, "input": false }
+		},
+		"log-lines": {
+			"type": "int",
+			"name": "Log Lines",
+			"description": "How many recent saves the overlay lists (0 shows just the header and stats).",
+			"default": 4,
+			"min": 0,
+			"max": 8,
+			"control": { "arrows": true, "slider": false, "input": false }
+		},
+		"show-expired": {
+			"type": "bool",
+			"name": "Log Unused Buffers",
+			"description": "Also log early clicks that were held for the whole window but never turned into an action.",
+			"default": false
+		},
+		"hide-when-off": {
+			"type": "bool",
+			"name": "Hide When Off",
+			"description": "Hide the overlay while the buffer is Off. It always shows while a stage is active.",
+			"default": false
+		},
+		"console-log": {
+			"type": "bool",
+			"name": "Console Telemetry",
+			"description": "Mirror every save and stage change to the Geode console / log file.",
+			"default": true
+		}
+	}
+}
